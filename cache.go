@@ -36,6 +36,8 @@ type tlruWrapper struct {
 type cache struct {
 	disgord.CacheNop
 
+	ReturnGetGuildMembers bool
+
 	CurrentUserMu sync.Mutex
 	CurrentUser   *disgord.User
 
@@ -408,7 +410,16 @@ func (c *cache) GetGuild(id disgord.Snowflake) (*disgord.Guild, error) {
 		c.Guilds.Unlock()
 		return nil, nil
 	}
+	var membersBefore []*disgord.Member
+	if !c.ReturnGetGuildMembers {
+		g := res.(*disgord.Guild)
+		membersBefore = g.Members
+		g.Members = []*disgord.Member{}
+	}
 	cpy := res.(*disgord.Guild).DeepCopy().(*disgord.Guild)
+	if !c.ReturnGetGuildMembers {
+		res.(*disgord.Guild).Members = membersBefore
+	}
 	c.Guilds.Unlock()
 
 	// Get the channels.
@@ -490,6 +501,8 @@ func (c *cache) GetUser(id disgord.Snowflake) (*disgord.User, error) {
 
 // CacheConfig is used to define the cache configuration.
 type CacheConfig struct {
+	DoNotReturnGetGuildMembers bool
+
 	UserMaxItems int
 	UserMaxBytes int
 	UserDuration time.Duration
@@ -506,6 +519,7 @@ type CacheConfig struct {
 // NewCache is used to create a new cache.
 func NewCache(conf CacheConfig) disgord.Cache {
 	return &cache{
+		ReturnGetGuildMembers:    !conf.DoNotReturnGetGuildMembers,
 		CurrentUser:              &disgord.User{},
 		ChannelMu:                sync.RWMutex{},
 		Channels:                 map[disgord.Snowflake]*disgord.Channel{},
