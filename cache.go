@@ -1,8 +1,10 @@
 package disgordtlru
 
 import (
+	"container/list"
 	"github.com/andersfylling/disgord"
-	"github.com/jakemakesstuff/go-tlru"
+	"github.com/andersfylling/disgord/json"
+	"github.com/auttaja/go-tlru"
 	"sync"
 	"time"
 )
@@ -34,20 +36,49 @@ type tlruWrapper struct {
 type cache struct {
 	disgord.CacheNop
 
-	unmarshalUpdate disgord.UnmarshalUpdater
-
 	CurrentUserMu sync.Mutex
 	CurrentUser   *disgord.User
 
+	ChannelMu                sync.RWMutex
+	Channels                 map[disgord.Snowflake]*disgord.Channel
+	GuildChannelRelationship map[disgord.Snowflake]*list.List
+
 	Users       *tlruWrapper
 	VoiceStates *tlruWrapper
-	Channels    *tlruWrapper
-	Guilds     	*tlruWrapper
+	Guilds      *tlruWrapper
 }
 
-func (c *cache) RegisterUnmarshaler(unmarshaler disgord.UnmarshalUpdater) {
-	c.unmarshalUpdate = unmarshaler
-	c.CacheNop.RegisterUnmarshaler(unmarshaler)
+func (c *cache) registerChannelRelationship(guildId, channelId disgord.Snowflake) {
+	if guildId == 0 {
+		return
+	}
+	relationships, ok := c.GuildChannelRelationship[guildId]
+	if !ok {
+		relationships = list.New()
+		c.GuildChannelRelationship[guildId] = relationships
+	}
+	relationships.PushBack(channelId)
+}
+
+func (c *cache) destroyChannelRelationship(guildId, channelId disgord.Snowflake) {
+	if guildId == 0 {
+		return
+	}
+	relationships, ok := c.GuildChannelRelationship[guildId]
+	if !ok {
+		return
+	}
+	blank := true
+	for x := relationships.Front(); x != nil; x = x.Next() {
+		if x.Value.(disgord.Snowflake) == channelId {
+			relationships.Remove(x)
+			break
+		}
+		blank = false
+	}
+	if blank {
+		delete(c.GuildChannelRelationship, guildId)
+	}
 }
 
 func (c *cache) Ready(data []byte) (*disgord.Ready, error) {
@@ -58,7 +89,7 @@ func (c *cache) Ready(data []byte) (*disgord.Ready, error) {
 		User: c.CurrentUser,
 	}
 
-	err := c.unmarshalUpdate(data, rdy)
+	err := json.Unmarshal(data, rdy)
 	return rdy, err
 }
 
@@ -68,43 +99,45 @@ func (c *cache) ChannelCreate(data []byte) (*disgord.ChannelCreate, error) {
 	}
 
 	var channel *disgord.Channel
-	if err := c.unmarshalUpdate(data, &channel); err != nil {
+	if err := json.Unmarshal(data, &channel); err != nil {
 		return nil, err
 	}
 
-	c.Channels.Lock()
-	defer c.Channels.Unlock()
-	if wrapper, exists := c.Channels.Get(channel.ID); exists {
-		err := c.unmarshalUpdate(data, wrapper)
+	c.ChannelMu.Lock()
+	defer c.ChannelMu.Unlock()
+	if wrapper, exists := c.Channels[channel.ID]; exists {
+		err := json.Unmarshal(data, wrapper)
 		return wrap(channel), err
 	}
 
-	c.Channels.Set(channel.ID, channel)
+	c.Channels[channel.ID] = channel
+	c.registerChannelRelationship(channel.GuildID, channel.ID)
 
 	return wrap(channel), nil
 }
 
 func (c *cache) ChannelUpdate(data []byte) (*disgord.ChannelUpdate, error) {
 	var metadata *idHolder
-	if err := c.unmarshalUpdate(data, &metadata); err != nil {
+	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, err
 	}
 	channelID := metadata.ID
 
-	c.Channels.Lock()
-	defer c.Channels.Unlock()
+	c.ChannelMu.Lock()
+	defer c.ChannelMu.Unlock()
 
 	var channel *disgord.Channel
-	if item, exists := c.Channels.Get(channelID); exists {
-		channel = item.(*disgord.Channel)
-		if err := c.unmarshalUpdate(data, channel); err != nil {
+	var exists bool
+	if channel, exists = c.Channels[channelID]; exists {
+		if err := json.Unmarshal(data, channel); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := c.unmarshalUpdate(data, &channel); err != nil {
+		if err := json.Unmarshal(data, &channel); err != nil {
 			return nil, err
 		}
-		c.Channels.Set(channelID, item)
+		c.Channels[channelID] = channel
+		c.registerChannelRelationship(channel.GuildID, channel.ID)
 	}
 
 	return &disgord.ChannelUpdate{Channel: channel}, nil
@@ -112,20 +145,21 @@ func (c *cache) ChannelUpdate(data []byte) (*disgord.ChannelUpdate, error) {
 
 func (c *cache) ChannelDelete(data []byte) (*disgord.ChannelDelete, error) {
 	var cd *disgord.ChannelDelete
-	if err := c.unmarshalUpdate(data, &cd); err != nil {
+	if err := json.Unmarshal(data, &cd); err != nil {
 		return nil, err
 	}
 
-	c.Channels.Lock()
-	defer c.Channels.Unlock()
-	c.Channels.Delete(cd.Channel.ID)
+	c.ChannelMu.Lock()
+	defer c.ChannelMu.Unlock()
+	delete(c.Channels, cd.Channel.ID)
+	c.destroyChannelRelationship(cd.Channel.GuildID, cd.Channel.ID)
 
 	return cd, nil
 }
 
 func (c *cache) ChannelPinsUpdate(data []byte) (*disgord.ChannelPinsUpdate, error) {
 	var cpu *disgord.ChannelPinsUpdate
-	if err := c.unmarshalUpdate(data, &cpu); err != nil {
+	if err := json.Unmarshal(data, &cpu); err != nil {
 		return nil, err
 	}
 
@@ -133,10 +167,9 @@ func (c *cache) ChannelPinsUpdate(data []byte) (*disgord.ChannelPinsUpdate, erro
 		return cpu, nil
 	}
 
-	c.Channels.Lock()
-	defer c.Channels.Unlock()
-	if item, exists := c.Channels.Get(cpu.ChannelID); exists {
-		channel := item.(*disgord.Channel)
+	c.ChannelMu.Lock()
+	defer c.ChannelMu.Unlock()
+	if channel, exists := c.Channels[cpu.ChannelID]; exists {
 		channel.LastPinTimestamp = cpu.LastPinTimestamp
 	}
 
@@ -148,7 +181,7 @@ func (c *cache) UserUpdate(data []byte) (*disgord.UserUpdate, error) {
 
 	c.CurrentUserMu.Lock()
 	defer c.CurrentUserMu.Unlock()
-	if err := c.unmarshalUpdate(data, update); err != nil {
+	if err := json.Unmarshal(data, update); err != nil {
 		return nil, err
 	}
 
@@ -157,7 +190,7 @@ func (c *cache) UserUpdate(data []byte) (*disgord.UserUpdate, error) {
 
 func (c *cache) VoiceServerUpdate(data []byte) (*disgord.VoiceServerUpdate, error) {
 	var vsu *disgord.VoiceServerUpdate
-	if err := c.unmarshalUpdate(data, &vsu); err != nil {
+	if err := json.Unmarshal(data, &vsu); err != nil {
 		return nil, err
 	}
 
@@ -166,7 +199,7 @@ func (c *cache) VoiceServerUpdate(data []byte) (*disgord.VoiceServerUpdate, erro
 
 func (c *cache) GuildMemberRemove(data []byte) (*disgord.GuildMemberRemove, error) {
 	var gmr *disgord.GuildMemberRemove
-	if err := c.unmarshalUpdate(data, &gmr); err != nil {
+	if err := json.Unmarshal(data, &gmr); err != nil {
 		return nil, err
 	}
 
@@ -190,7 +223,7 @@ func (c *cache) GuildMemberRemove(data []byte) (*disgord.GuildMemberRemove, erro
 
 func (c *cache) GuildMemberAdd(data []byte) (*disgord.GuildMemberAdd, error) {
 	var gmr *disgord.GuildMemberAdd
-	if err := c.unmarshalUpdate(data, &gmr); err != nil {
+	if err := json.Unmarshal(data, &gmr); err != nil {
 		return nil, err
 	}
 
@@ -211,7 +244,7 @@ func (c *cache) GuildMemberAdd(data []byte) (*disgord.GuildMemberAdd, error) {
 		for i := range guild.Members { // slow... map instead?
 			if guild.Members[i].UserID == gmr.Member.User.ID {
 				member = guild.Members[i]
-				if err := c.unmarshalUpdate(data, member); err != nil {
+				if err := json.Unmarshal(data, member); err != nil {
 					return nil, err
 				}
 				break
@@ -232,12 +265,30 @@ func (c *cache) GuildMemberAdd(data []byte) (*disgord.GuildMemberAdd, error) {
 
 func (c *cache) GuildCreate(data []byte) (*disgord.GuildCreate, error) {
 	var guildEvt *disgord.GuildCreate
-	if err := c.unmarshalUpdate(data, &guildEvt); err != nil {
+	if err := json.Unmarshal(data, &guildEvt); err != nil {
 		return nil, err
 	}
 
 	c.Guilds.Lock()
 	defer c.Guilds.Unlock()
+
+	setChannels := func() {
+		c.ChannelMu.Lock()
+		defer c.ChannelMu.Unlock()
+		relationships, ok := c.GuildChannelRelationship[guildEvt.Guild.ID]
+		if ok {
+			// We should remove these.
+			for x := relationships.Front(); x != nil; x = x.Next() {
+				delete(c.Channels, x.Value.(disgord.Snowflake))
+			}
+		}
+		relationships = list.New()
+		c.GuildChannelRelationship[guildEvt.Guild.ID] = relationships
+		for _, channel := range guildEvt.Guild.Channels {
+			relationships.PushBack(channel.ID)
+			c.Channels[channel.ID] = channel.DeepCopy().(*disgord.Channel)
+		}
+	}
 
 	if item, exists := c.Guilds.Get(guildEvt.Guild.ID); exists {
 		guild := item.(*disgord.Guild)
@@ -245,16 +296,18 @@ func (c *cache) GuildCreate(data []byte) (*disgord.GuildCreate, error) {
 			if len(guild.Members) > 0 {
 				// seems like an update event came before create
 				// this kinda... isn't good
-				_ = c.unmarshalUpdate(data, item)
+				_ = json.Unmarshal(data, item)
 			} else {
 				// duplicate event
 				return guildEvt, nil
 			}
 		} else {
 			c.Guilds.Set(guildEvt.Guild.ID, guildEvt.Guild)
+			setChannels()
 		}
 	} else {
 		c.Guilds.Set(guildEvt.Guild.ID, guildEvt.Guild)
+		setChannels()
 	}
 
 	return guildEvt, nil
@@ -262,7 +315,7 @@ func (c *cache) GuildCreate(data []byte) (*disgord.GuildCreate, error) {
 
 func (c *cache) GuildUpdate(data []byte) (*disgord.GuildUpdate, error) {
 	var guildEvt *disgord.GuildUpdate
-	if err := c.unmarshalUpdate(data, &guildEvt); err != nil {
+	if err := json.Unmarshal(data, &guildEvt); err != nil {
 		return nil, err
 	}
 
@@ -273,7 +326,7 @@ func (c *cache) GuildUpdate(data []byte) (*disgord.GuildUpdate, error) {
 		guild := item.(*disgord.Guild)
 		if guild.Unavailable {
 			c.Guilds.Set(guildEvt.Guild.ID, guildEvt.Guild)
-		} else if err := c.unmarshalUpdate(data, item); err != nil {
+		} else if err := json.Unmarshal(data, item); err != nil {
 			return nil, err
 		}
 	} else {
@@ -285,7 +338,7 @@ func (c *cache) GuildUpdate(data []byte) (*disgord.GuildUpdate, error) {
 
 func (c *cache) GuildDelete(data []byte) (*disgord.GuildDelete, error) {
 	var guildEvt *disgord.GuildDelete
-	if err := c.unmarshalUpdate(data, &guildEvt); err != nil {
+	if err := json.Unmarshal(data, &guildEvt); err != nil {
 		return nil, err
 	}
 
@@ -293,7 +346,146 @@ func (c *cache) GuildDelete(data []byte) (*disgord.GuildDelete, error) {
 	defer c.Guilds.Unlock()
 	c.Guilds.Delete(guildEvt.UnavailableGuild.ID)
 
+	c.ChannelMu.Lock()
+	defer c.ChannelMu.Unlock()
+	relationships, ok := c.GuildChannelRelationship[guildEvt.UnavailableGuild.ID]
+	if ok {
+		for x := relationships.Front(); x != nil; x = x.Next() {
+			delete(c.Channels, x.Value.(disgord.Snowflake))
+		}
+		delete(c.GuildChannelRelationship, guildEvt.UnavailableGuild.ID)
+	}
+
 	return guildEvt, nil
+}
+
+func (c *cache) GetChannel(id disgord.Snowflake) (*disgord.Channel, error) {
+	c.ChannelMu.RLock()
+	res, ok := c.Channels[id]
+	if !ok {
+		c.ChannelMu.RUnlock()
+		return nil, nil
+	}
+	cpy := res.DeepCopy().(*disgord.Channel)
+	c.ChannelMu.RUnlock()
+	return cpy, nil
+}
+
+func (c *cache) GetGuildEmoji(guildID, emojiID disgord.Snowflake) (*disgord.Emoji, error) {
+	c.Guilds.Lock()
+	defer c.Guilds.Unlock()
+	guild, ok := c.Guilds.Get(guildID)
+	if !ok {
+		return nil, nil
+	}
+	for _, emoji := range guild.(*disgord.Guild).Emojis {
+		if emoji.ID == emojiID {
+			return emoji.DeepCopy().(*disgord.Emoji), nil
+		}
+	}
+	return nil, nil
+}
+
+func (c *cache) GetGuildEmojis(id disgord.Snowflake) ([]*disgord.Emoji, error) {
+	c.Guilds.Lock()
+	defer c.Guilds.Unlock()
+	guild, ok := c.Guilds.Get(id)
+	if !ok {
+		return nil, nil
+	}
+	a := make([]*disgord.Emoji, len(guild.(*disgord.Guild).Emojis))
+	for i, emoji := range guild.(*disgord.Guild).Emojis {
+		a[i] = emoji.DeepCopy().(*disgord.Emoji)
+	}
+	return a, nil
+}
+
+func (c *cache) GetGuild(id disgord.Snowflake) (*disgord.Guild, error) {
+	// Make a copy of the guild.
+	c.Guilds.Lock()
+	res, ok := c.Guilds.Get(id)
+	if !ok {
+		c.Guilds.Unlock()
+		return nil, nil
+	}
+	cpy := res.(*disgord.Guild).DeepCopy().(*disgord.Guild)
+	c.Guilds.Unlock()
+
+	// Get the channels.
+	channelsRes, _ := c.GetGuildChannels(id)
+	if channelsRes != nil {
+		cpy.Channels = channelsRes
+	}
+
+	// Return the copy.
+	return cpy, nil
+}
+
+func (c *cache) GetGuildChannels(id disgord.Snowflake) ([]*disgord.Channel, error) {
+	c.ChannelMu.RLock()
+	defer c.ChannelMu.RUnlock()
+	relationships, ok := c.GuildChannelRelationship[id]
+	if !ok {
+		return nil, nil
+	}
+	channels := make([]*disgord.Channel, relationships.Len())
+	i := 0
+	for x := relationships.Front(); x != nil; x = x.Next() {
+		channels[i] = c.Channels[x.Value.(disgord.Snowflake)].DeepCopy().(*disgord.Channel)
+		i++
+	}
+	return channels, nil
+}
+
+func (c *cache) GetMember(guildID, userID disgord.Snowflake) (*disgord.Member, error) {
+	c.Guilds.Lock()
+	defer c.Guilds.Unlock()
+	guild, ok := c.Guilds.Get(guildID)
+	if !ok {
+		return nil, nil
+	}
+	for _, member := range guild.(*disgord.Guild).Members {
+		if member.UserID == userID {
+			return member, nil
+		}
+	}
+	return nil, nil
+}
+
+func (c *cache) GetGuildRoles(guildID disgord.Snowflake) ([]*disgord.Role, error) {
+	c.Guilds.Lock()
+	defer c.Guilds.Unlock()
+	guild, ok := c.Guilds.Get(guildID)
+	if !ok {
+		return nil, nil
+	}
+	a := make([]*disgord.Role, len(guild.(*disgord.Guild).Emojis))
+	for i, role := range guild.(*disgord.Guild).Roles {
+		a[i] = role.DeepCopy().(*disgord.Role)
+	}
+	return a, nil
+}
+
+func (c *cache) GetCurrentUser() (*disgord.User, error) {
+	c.CurrentUserMu.Lock()
+	var cpy *disgord.User
+	if c.CurrentUser != nil {
+		cpy = c.CurrentUser.DeepCopy().(*disgord.User)
+	}
+	c.CurrentUserMu.Unlock()
+	return cpy, nil
+}
+
+func (c *cache) GetUser(id disgord.Snowflake) (*disgord.User, error) {
+	c.Users.Lock()
+	res, ok := c.Users.Get(id)
+	if !ok {
+		c.Users.Unlock()
+		return nil, nil
+	}
+	cpy := res.(*disgord.User).DeepCopy().(*disgord.User)
+	c.Users.Unlock()
+	return cpy, nil
 }
 
 // CacheConfig is used to define the cache configuration.
@@ -306,10 +498,6 @@ type CacheConfig struct {
 	VoiceStatesMaxBytes int
 	VoiceStatesDuration time.Duration
 
-	ChannelMaxItems int
-	ChannelMaxBytes int
-	ChannelDuration time.Duration
-
 	GuildMaxItems int
 	GuildMaxBytes int
 	GuildDuration time.Duration
@@ -318,10 +506,12 @@ type CacheConfig struct {
 // NewCache is used to create a new cache.
 func NewCache(conf CacheConfig) disgord.Cache {
 	return &cache{
-		CurrentUser:     &disgord.User{},
-		Users:           &tlruWrapper{Cache: tlru.NewCache(conf.UserMaxItems, conf.UserMaxBytes, conf.UserDuration)},
-		VoiceStates:     &tlruWrapper{Cache: tlru.NewCache(conf.VoiceStatesMaxItems, conf.VoiceStatesMaxBytes, conf.VoiceStatesDuration)},
-		Channels:        &tlruWrapper{Cache: tlru.NewCache(conf.ChannelMaxItems, conf.ChannelMaxBytes, conf.ChannelDuration)},
-		Guilds:          &tlruWrapper{Cache: tlru.NewCache(conf.GuildMaxItems, conf.GuildMaxBytes, conf.GuildDuration)},
+		CurrentUser:              &disgord.User{},
+		ChannelMu:                sync.RWMutex{},
+		Channels:                 map[disgord.Snowflake]*disgord.Channel{},
+		GuildChannelRelationship: map[disgord.Snowflake]*list.List{},
+		Users:                    &tlruWrapper{Cache: tlru.NewCache(conf.UserMaxItems, conf.UserMaxBytes, conf.UserDuration)},
+		VoiceStates:              &tlruWrapper{Cache: tlru.NewCache(conf.VoiceStatesMaxItems, conf.VoiceStatesMaxBytes, conf.VoiceStatesDuration)},
+		Guilds:                   &tlruWrapper{Cache: tlru.NewCache(conf.GuildMaxItems, conf.GuildMaxBytes, conf.GuildDuration)},
 	}
 }
