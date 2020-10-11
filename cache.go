@@ -36,7 +36,11 @@ type tlruWrapper struct {
 type cache struct {
 	disgord.CacheNop
 
-	ReturnGetGuildMembers bool
+	ReturnGetGuildMembers   bool
+	ReturnGetGuildChannels  bool
+	ReturnGetGuildRoles     bool
+	ReturnGetGuildEmojis    bool
+	ReturnGetGuildPresences bool
 
 	CurrentUserMu sync.Mutex
 	CurrentUser   *disgord.User
@@ -179,10 +183,10 @@ func (c *cache) ChannelPinsUpdate(data []byte) (*disgord.ChannelPinsUpdate, erro
 }
 
 func (c *cache) UserUpdate(data []byte) (*disgord.UserUpdate, error) {
-	update := &disgord.UserUpdate{User: c.CurrentUser}
-
 	c.CurrentUserMu.Lock()
 	defer c.CurrentUserMu.Unlock()
+
+	update := &disgord.UserUpdate{User: c.CurrentUser}
 	if err := json.Unmarshal(data, update); err != nil {
 		return nil, err
 	}
@@ -411,21 +415,55 @@ func (c *cache) GetGuild(id disgord.Snowflake) (*disgord.Guild, error) {
 		return nil, nil
 	}
 	var membersBefore []*disgord.Member
+	var channelsBefore []*disgord.Channel
+	var rolesBefore []*disgord.Role
+	var emojisBefore []*disgord.Emoji
+	var presencesBefore []*disgord.UserPresence
+	g := res.(*disgord.Guild)
 	if !c.ReturnGetGuildMembers {
-		g := res.(*disgord.Guild)
 		membersBefore = g.Members
 		g.Members = []*disgord.Member{}
 	}
-	cpy := res.(*disgord.Guild).DeepCopy().(*disgord.Guild)
+	if !c.ReturnGetGuildChannels {
+		channelsBefore = g.Channels
+		g.Channels = []*disgord.Channel{}
+	}
+	if !c.ReturnGetGuildRoles {
+		rolesBefore = g.Roles
+		g.Roles = []*disgord.Role{}
+	}
+	if !c.ReturnGetGuildEmojis {
+		emojisBefore = g.Emojis
+		g.Emojis = []*disgord.Emoji{}
+	}
+	if !c.ReturnGetGuildPresences {
+		presencesBefore = g.Presences
+		g.Presences = []*disgord.UserPresence{}
+	}
+	cpy := g.DeepCopy().(*disgord.Guild)
 	if !c.ReturnGetGuildMembers {
-		res.(*disgord.Guild).Members = membersBefore
+		g.Members = membersBefore
+	}
+	if !c.ReturnGetGuildChannels {
+		g.Channels = channelsBefore
+	}
+	if !c.ReturnGetGuildRoles {
+		g.Roles = rolesBefore
+	}
+	if !c.ReturnGetGuildEmojis {
+		g.Emojis = emojisBefore
+	}
+	if !c.ReturnGetGuildPresences {
+		g.Presences = presencesBefore
 	}
 	c.Guilds.Unlock()
 
-	// Get the channels.
-	channelsRes, _ := c.GetGuildChannels(id)
-	if channelsRes != nil {
-		cpy.Channels = channelsRes
+	if c.ReturnGetGuildChannels {
+		// Get the channels.
+		channelsRes, _ := c.GetGuildChannels(id)
+		if channelsRes != nil {
+			cpy.Channels = channelsRes
+		}
 	}
 
 	// Return the copy.
@@ -457,7 +495,7 @@ func (c *cache) GetMember(guildID, userID disgord.Snowflake) (*disgord.Member, e
 	}
 	for _, member := range guild.(*disgord.Guild).Members {
 		if member.UserID == userID {
-			return member, nil
+			return member.DeepCopy().(*disgord.Member), nil
 		}
 	}
 	return nil, nil
@@ -470,7 +508,7 @@ func (c *cache) GetGuildRoles(guildID disgord.Snowflake) ([]*disgord.Role, error
 	if !ok {
 		return nil, nil
 	}
-	a := make([]*disgord.Role, len(guild.(*disgord.Guild).Emojis))
+	a := make([]*disgord.Role, len(guild.(*disgord.Guild).Roles))
 	for i, role := range guild.(*disgord.Guild).Roles {
 		a[i] = role.DeepCopy().(*disgord.Role)
 	}
@@ -501,7 +539,11 @@ func (c *cache) GetUser(id disgord.Snowflake) (*disgord.User, error) {
 
 // CacheConfig is used to define the cache configuration.
 type CacheConfig struct {
-	DoNotReturnGetGuildMembers bool
+	DoNotReturnGetGuildMembers  bool
+	DoNotReturnGetGuildChannels bool
+	DoNotReturnGetGuildRoles    bool
+	DoNotReturnGetGuildEmojis   bool
+	DoNotReturnGuildPresences   bool
 
 	UserMaxItems int
 	UserMaxBytes int
@@ -520,6 +562,10 @@ type CacheConfig struct {
 func NewCache(conf CacheConfig) disgord.Cache {
 	return &cache{
 		ReturnGetGuildMembers:    !conf.DoNotReturnGetGuildMembers,
+		ReturnGetGuildChannels:   !conf.DoNotReturnGetGuildChannels,
+		ReturnGetGuildRoles:      !conf.DoNotReturnGetGuildRoles,
+		ReturnGetGuildEmojis:     !conf.DoNotReturnGetGuildEmojis,
+		ReturnGetGuildPresences:  !conf.DoNotReturnGuildPresences,
 		CurrentUser:              &disgord.User{},
 		ChannelMu:                sync.RWMutex{},
 		Channels:                 map[disgord.Snowflake]*disgord.Channel{},
